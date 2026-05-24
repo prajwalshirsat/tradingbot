@@ -13,8 +13,8 @@ CHECK_INTERVAL = 60         # Check price every 60 seconds
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("8876089532:AAHayR7kZ0SHcRNwBcqOCCVIObzzLkgNA7")
+TELEGRAM_CHAT_ID = os.getenv("1269772473")
 
 
 # =========================
