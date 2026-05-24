@@ -169,10 +169,22 @@ def scan_india():
         scan_market("INDIA_INDEX", aliases, INDEX_TFS, INDIA_BOT_TOKEN)
     scan_market("INDIA_STOCKS", TOP15_STOCKS_NS, STOCK_TFS, INDIA_BOT_TOKEN)
 
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Trading Bot Running Successfully ✅"
+
 if __name__ == "__main__":
     print("Starting bot...")
+
     scheduler = BackgroundScheduler()
     scheduler.add_job(scan_crypto, 'interval', minutes=5)
     scheduler.add_job(scan_india, 'interval', minutes=5)
     scheduler.start()
-    print("Scheduler")
+
+    print("Scheduler started.")
+
+    app.run(host="0.0.0.0", port=10000)
