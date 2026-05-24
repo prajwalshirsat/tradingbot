@@ -3,3 +3,7 @@ pandas
 numpy
 yfinance
 matplotlib
+flask
+gunicorn
+apscheduler
+pytz
