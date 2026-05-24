@@ -1,280 +1,178 @@
 import time
 import requests
-from datetime import datetime, timezone, timedelta
+import pandas as pd
+import pytz
+import yfinance as yf
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta, timezone
+from apscheduler.schedulers.background import BackgroundScheduler
+import io
 
-# =========================
-# SETTINGS
-# =========================
-
-SYMBOL = "BTCUSDT"
-POINT_RANGE = 300
-CHECK_INTERVAL = 60
-
+# Bot Configuration
+CRYPTO_BOT_TOKEN = "7604294147:AAHRyGR2MX0_wNuQUIr1_QlIrAFc34bxuz8"
+INDIA_BOT_TOKEN = "8462939843:AAEvcFCJKaZqTawZKwPyidvDoy4kFO1j6So"
+CHAT_IDS = ["1343842801", "1269772473"]
+SEPARATOR = "━━━━━━━✦✧✦━━━━━━━"
 IST = timezone(timedelta(hours=5, minutes=30))
+BIG_TFS = {"4h", "1d", "1w", "1M"}
+TF_COOLDOWN_SEC = {
+    "15m": 720, "1h": 3300, "2h": 6600, "4h": 13200,
+    "1d": 79200, "1w": 561600, "1M": 2505600
+}
+CRYPTO_SYMBOLS = ["bitcoin", "ethereum", "solana", "binancecoin", "ripple", "dogecoin"]
 
-# =========================
-# TELEGRAM DETAILS
-# =========================
+CRYPTO_TFS = ["3m", "5m", "15m", "1h", "4h", "1d", "1w", "30d"]
+INDICES_MAP = {
+    "NIFTY 50": ["^NSEI"],
+    "NIFTY BANK": ["^NSEBANK"]
+}
+TOP15_STOCKS_NS = [
+    "RELIANCE.NS","TCS.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS",
+    "LT.NS","ITC.NS","SBIN.NS","BHARTIARTL.NS","AXISBANK.NS",
+    "KOTAKBANK.NS","HINDUNILVR.NS","ASIANPAINTS.NS","MARUTI.NS","BAJFINANCE.NS"
+]
+INDEX_TFS = ["15m", "1h", "4h", "1d", "1w"]
+STOCK_TFS = ["1h", "1d", "1w"]
 
-TELEGRAM_BOT_TOKEN = "8876089532:AAHayR7kZ0SHcRNwBcqOCCVIObzzLkgNA7c"
-TELEGRAM_CHAT_ID = "1269772473"
+last_alert_at = {}
+last_bar_key = set()
 
-# =========================
-# TELEGRAM FUNCTION
-# =========================
+def ist_now_str():
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M")
 
-def send_telegram_message(message):
+def is_india_market_hours():
+    now = datetime.now(IST)
+    return now.weekday() < 5 and now.hour >= 9 and now.hour < 15
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+def cooldown_ok(market, symbol, tf, direction):
+    key = (market, symbol, tf, direction)
+    now = int(datetime.now(IST).timestamp())
+    cd = TF_COOLDOWN_SEC.get(tf, 600)
+    last = last_alert_at.get(key, 0)
+    if now - last >= cd:
+        last_alert_at[key] = now
+        return True
+    return False
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
+def send_telegram(bot_token, messages, image_buf=None):
+    if not messages:
+        return
+    payload = f"\n{SEPARATOR}\n".join(messages)
+    for chat_id in CHAT_IDS:
+        try:
+            if image_buf:
+                url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+                files = {"photo": ("chart.png", image_buf.getvalue())}
+                data = {"chat_id": chat_id, "caption": payload}
+                requests.post(url, data=data, files=files)
+            else:
+                url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                requests.post(url, json={"chat_id": chat_id, "text": payload})
+        except Exception as e:
+            print(f"{ist_now_str()} - Telegram error: {e}")
 
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        print("Telegram message sent.")
+def is_doji(open_, high, low, close):
+    body = abs(open_ - close)
+    rng = high - low
+    return rng != 0 and body <= 0.2 * rng
 
-    except Exception as e:
-        print(f"Telegram error: {e}")
+def detect_multi_doji_breakout(df):
+    if df is None or len(df) < 3:
+        return False, None, None, None, None, None
+    candles = df.iloc[:-1]
+    breakout = df.iloc[-1]
+    dojis = candles[candles.apply(lambda x: is_doji(x["open"], x["high"], x["low"], x["close"]), axis=1)]
+    if len(dojis) < 2:
+        return False, None, None, None, None, None
+    body_high = max(dojis[["open","close"]].max())
+    body_low = min(dojis[["open","close"]].min())
+    direction = "UP ✅" if breakout["high"] > body_high else "DOWN ✅" if breakout["low"] < body_low else None
+    return bool(direction), direction, body_low, body_high, breakout["close"], breakout["time"]
 
-# =========================
-# BINANCE FUNCTIONS
-# =========================
-
-def get_1h_candles():
-
-    url = "https://api.binance.com/api/v3/klines"
-
-    params = {
-        "symbol": SYMBOL,
-        "interval": "1h",
-        "limit": 50
-    }
-
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-
-    return response.json()
-
-def get_current_price():
-
-    url = "https://api.binance.com/api/v3/ticker/price"
-
-    params = {
-        "symbol": SYMBOL
-    }
-
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-
-    return float(response.json()["price"])
-
-# =========================
-# CANDLE LOGIC
-# =========================
-
-def find_530_candle():
-
-    candles = get_1h_candles()
-
-    for candle in candles:
-
-        open_time_utc = datetime.fromtimestamp(
-            candle[0] / 1000,
-            tz=timezone.utc
-        )
-
-        open_time_ist = open_time_utc.astimezone(IST)
-
-        if open_time_ist.hour == 17 and open_time_ist.minute == 30:
-
-            return {
-                "open": float(candle[1]),
-                "high": float(candle[2]),
-                "low": float(candle[3]),
-                "close": float(candle[4])
-            }
-
-    return None
-
-def classify_candle(candle):
-
-    open_price = candle["open"]
-    close_price = candle["close"]
-
-    high_price = candle["high"]
-    low_price = candle["low"]
-
-    candle_range = high_price - low_price
-
-    body_size = abs(close_price - open_price)
-
-    if candle_range <= 0:
-        return "neutral"
-
-    body_ratio = body_size / candle_range
-
-    if body_ratio < 0.55:
-        return "neutral"
-
-    if close_price > open_price:
-        return "strong_bullish"
-
-    if close_price < open_price:
-        return "strong_bearish"
-
-    return "neutral"
-
-# =========================
-# MAIN BOT
-# =========================
-
-def main():
-
-    send_telegram_message(
-        f"✅ BTC One Hour Bot Started"
+def make_msg(symbol, tf, direction, low, high, last_close, market):
+    ts = ist_now_str()
+    return (
+        f"🚨 {symbol.upper()} | {tf} | {direction}\n"
+        f"Range: {low:.2f}-{high:.2f} | Price: {last_close:.2f}\n"
+        f"🕒 {ts} IST"
     )
 
-    signal_checked = False
-    alert_sent = False
+def plot_chart(df, symbol, tf, direction, low, high, last_close):
+    df = df.tail(10).copy()
+    fig, ax = plt.subplots(figsize=(6,4))
+    ax.set_title(f"{symbol} {tf} | {direction}", fontsize=10)
+    for i, row in df.iterrows():
+        color = "green" if row["close"] >= row["open"] else "red"
+        ax.plot([i,i],[row["low"], row["high"]], color=color)
+        ax.add_patch(plt.Rectangle((i-0.3, min(row["open"], row["close"])),
+                                   0.6, abs(row["open"]-row["close"]),
+                                   color=color, alpha=0.6))
+    ax.axhline(low, color="blue", linestyle="--")
+    ax.axhline(high, color="orange", linestyle="--")
+    ax.axhline(last_close, color="black", linestyle=":")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    plt.close(fig)
+    return buf
 
-    candle_type = None
-    buy_level = None
-    sell_level = None
+def fetch_crypto_ohlc(symbol, tf, limit=8):
+    days_map = {
+        "15m": 1, "1h": 1, "2h": 1, "4h": 1,
+        "1d": 1, "1w": 7, "1M": 30
+    }
+    days = days_map.get(tf, 1)
+    url = f"https://api.coingecko.com/api/v3/coins/{symbol}/ohlc?vs_currency=usd&days={days}"
+    try:
+        res = requests.get(url)
+        res.raise_for_status()
+        data = res.json()
+        df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close"])
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        return df
+    except Exception as e:
+        print(f"{ist_now_str()} - CoinGecko error for {symbol}: {e}")
+        return pd.DataFrame()
 
-    current_day = datetime.now(IST).date()
 
-    while True:
+def fetch_yf_ohlc(symbol, tf):
+    try:
+        df = yf.download(symbol, period="30d", interval="1d", progress=False)
+        df = df.rename(columns=str.lower)
+        df["time"] = df.index
+        return df[["open","high","low","close","time"]]
+    except:
+        return pd.DataFrame()
 
-        now = datetime.now(IST)
+def scan_market(market, symbols, tfs, bot_token):
+    for symbol in symbols:
+        for tf in tfs:
+            df = fetch_crypto_ohlc(symbol, tf) if market == "CRYPTO" else fetch_yf_ohlc(symbol, tf)
+            if df.empty or len(df) < 3:
+                continue
+            trig, direction, low, high, last_close, bar_ts = detect_multi_doji_breakout(df)
+            if trig and cooldown_ok(market, symbol, tf, direction):
+                msg = make_msg(symbol, tf, direction, low, high, last_close, market)
+                chart_buf = plot_chart(df, symbol, tf, direction, low, high, last_close)
+                send_telegram(bot_token, [msg], chart_buf)
 
-        # Reset daily
-        if now.date() != current_day:
+def scan_crypto():
+    print(f"{ist_now_str()} - Scanning crypto market")
+    scan_market("CRYPTO", CRYPTO_SYMBOLS, CRYPTO_TFS, CRYPTO_BOT_TOKEN)
 
-            current_day = now.date()
-
-            signal_checked = False
-            alert_sent = False
-
-            candle_type = None
-            buy_level = None
-            sell_level = None
-
-        # Check candle after 6:30 PM
-        if now.hour == 18 and now.minute >= 30 and not signal_checked:
-
-            try:
-
-                candle = find_530_candle()
-
-                if candle is None:
-
-                    send_telegram_message(
-                        "⚠️ Candle not found"
-                    )
-
-                    signal_checked = True
-                    continue
-
-                candle_type = classify_candle(candle)
-
-                # BULLISH
-                if candle_type == "strong_bullish":
-
-                    buy_level = candle["high"] + POINT_RANGE
-
-                    send_telegram_message(
-
-                        f"🟢 Strong Bullish Candle\n\n"
-                        f"High = {candle['high']}\n"
-                        f"Buy Level = {buy_level}\n\n"
-                        f"Sentiment = BUY"
-
-                    )
-
-                # BEARISH
-                elif candle_type == "strong_bearish":
-
-                    sell_level = candle["low"] - POINT_RANGE
-
-                    send_telegram_message(
-
-                        f"🔴 Strong Bearish Candle\n\n"
-                        f"Low = {candle['low']}\n"
-                        f"Sell Level = {sell_level}\n\n"
-                        f"Sentiment = SELL"
-
-                    )
-
-                # NEUTRAL
-                else:
-
-                    send_telegram_message(
-
-                        "⚪ Neutral Candle\n\n"
-                        "Avoid Trading Today"
-
-                    )
-
-                    alert_sent = True
-
-                signal_checked = True
-
-            except Exception as e:
-
-                send_telegram_message(
-                    f"❌ Error = {e}"
-                )
-
-        # Monitor breakout
-        if signal_checked and not alert_sent:
-
-            try:
-
-                current_price = get_current_price()
-
-                # BUY BREAKOUT
-                if candle_type == "strong_bullish":
-
-                    if current_price >= buy_level:
-
-                        send_telegram_message(
-
-                            f"🚀 BUY BREAKOUT\n\n"
-                            f"BTC crossed {buy_level}\n"
-                            f"Current Price = {current_price}"
-
-                        )
-
-                        alert_sent = True
-
-                # SELL BREAKDOWN
-                elif candle_type == "strong_bearish":
-
-                    if current_price <= sell_level:
-
-                        send_telegram_message(
-
-                            f"📉 SELL BREAKDOWN\n\n"
-                            f"BTC crossed {sell_level}\n"
-                            f"Current Price = {current_price}"
-
-                        )
-
-                        alert_sent = True
-
-            except Exception as e:
-
-                print(e)
-
-        time.sleep(CHECK_INTERVAL)
-
-# =========================
-# RUN BOT
-# =========================
+def scan_india():
+    if not is_india_market_hours():
+        print(f"{ist_now_str()} - India market closed.")
+        return
+    for idx_name, aliases in INDICES_MAP.items():
+        scan_market("INDIA_INDEX", aliases, INDEX_TFS, INDIA_BOT_TOKEN)
+    scan_market("INDIA_STOCKS", TOP15_STOCKS_NS, STOCK_TFS, INDIA_BOT_TOKEN)
 
 if __name__ == "__main__":
-    main()
+    print("Starting bot...")
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(scan_crypto, 'interval', minutes=5)
+    scheduler.add_job(scan_india, 'interval', minutes=5)
+    scheduler.start()
+    print("Scheduler")
